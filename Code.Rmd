@@ -1,0 +1,1598 @@
+---
+title: "Mapping global high-resolution sustainable development trends over two decades"
+author: "Yangyang Guo, Wenhua Yu, Rongbin Xu, Zhihu Xu, Tingting Ye, Michael Tong, Sotiris Vardoulakis, Yuming Guo, and Xuemei Bai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+required_pkgs <- c(
+  "tidyverse", "dplyr", "broom", "raster", "stars", "rasterVis",
+  "sf", "sp", "rnaturalearth", "furrr", "future",
+  "cowplot", "openxlsx", "Kendall"
+)
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop(
+    "Please install the required packages before running this script: ",
+    paste(missing_pkgs, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+root_dir <- "."
+dir_data <- file.path(root_dir, "data")
+dir_grid <- file.path(dir_data, "grid_data_2000_2019")
+dir_external <- file.path(dir_data, "external")
+dir_corr <- file.path(dir_data, "correlation")
+
+dir_plots <- file.path(root_dir, "plots_data")
+dir_results <- file.path(root_dir, "Results")
+dir_results_data <- file.path(dir_results, "data")
+dir_results_plots <- file.path(dir_results, "result_plots")
+dir_results_corr <- file.path(dir_results, "raster_correlation")
+
+dir_fig3 <- file.path(dir_plots, "Fig_3")
+dir_table1 <- file.path(dir_plots, "Table1")
+dir_fig4 <- file.path(dir_plots, "Fig4")
+dir_ssp_population <- file.path(dir_external, "ssp_population")
+
+dirs_to_create <- c(
+  dir_data, dir_grid, dir_external, dir_corr,
+  dir_plots, dir_results, dir_results_data,
+  dir_results_plots, dir_results_corr,
+  dir_fig3, dir_table1, dir_fig4, dir_ssp_population
+)
+
+invisible(lapply(dirs_to_create, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+check_file <- function(path) {
+  if (!file.exists(path)) {
+    stop("Required file not found: ", normalizePath(path, winslash = "/", mustWork = FALSE), call. = FALSE)
+  }
+  path
+}
+
+path_grid <- function(indicator) {
+  file.path(dir_grid, paste0("grid_", indicator, "_data_df_update.rds"))
+}
+
+path_result_trend <- function(indicator) {
+  file.path(dir_results, paste0(indicator, "_trend_global_update.tif"))
+}
+```
+
+This repository contains the main code for the article **"Mapping global high-resolution sustainable development trends over two decades"**.
+
+We use four headline indicators to measure sustainable development trends over the past two decades:
+
+- **PM2.5** – an air pollution control indicator
+- **CO2** – a climate change mitigation indicator
+- **Nightlight** – a socioeconomic activity and infrastructure development indicator
+- **NDVI** – an ecosystem vitality indicator
+
+The annual indicator data used in this analysis are available via Figshare. In this public code version, all file paths use relative project directories.
+
+## Expected project structure
+
+```{r project-structure, echo=FALSE, results='asis'}
+cat("
+repo/
+├─ code.Rmd
+├─ data/
+│  ├─ grid_data_2000_2019/
+│  │  ├─ grid_PM2_5_data_df_update.rds
+│  │  ├─ grid_co2_data_df_update.rds
+│  │  ├─ grid_NDVI_data_df_update.rds
+│  │  └─ grid_nightlight_data_df_update.rds
+│  ├─ correlation/
+│  │  ├─ Sustainable_trend_pattern_with_GDP_extracted.rds
+│  │  └─ table1_df_updated_20250307.rds
+│  └─ external/
+│     └─ ssp_population/
+│        ├─ ssp1_total_2030.nc4
+│        ├─ ssp2_total_2030.nc4
+│        ├─ ssp3_total_2030.nc4
+│        ├─ ssp4_total_2030.nc4
+│        └─ ssp5_total_2030.nc4
+├─ plots_data/
+│  ├─ landscan_global_UN_adjusted_2019.tif
+│  ├─ year_urban_2019_resample.tif
+│  ├─ World_bank_income_group_2019.csv
+│  └─ region_raster_df.rds
+└─ Results/
+")
+```
+
+## 1. Change in indicator values per decade
+
+```{r}
+trend_function_update <- function(indicator = "co2") {
+
+  grid_file <- path_grid(indicator)
+  grid_data_df <- readRDS(check_file(grid_file))
+
+  e1 <- Sys.time()
+
+  trend_data <-
+    grid_data_df %>%
+    tidyr::nest(data = -c(x, y)) %>%
+    dplyr::mutate(
+      model = purrr::map(data, ~ stats::lm(value ~ year, data = .x)),
+      tidied = purrr::map(model, broom::tidy)
+    ) %>%
+    tidyr::unnest(tidied) %>%
+    dplyr::filter(term == "year") %>%
+    dplyr::select(x, y, estimate, p.value)
+
+  saveRDS(
+    trend_data,
+    file = file.path(dir_results_data, paste0("trend_", indicator, "_update2.rds"))
+  )
+
+  e2 <- Sys.time()
+  print(e2 - e1)
+
+  trend_data_clean <- trend_data %>%
+    dplyr::filter(
+      estimate >= stats::quantile(trend_data$estimate, 0.0001, na.rm = TRUE),
+      estimate <= stats::quantile(trend_data$estimate, 0.9999, na.rm = TRUE)
+    ) %>%
+    dplyr::mutate(estimate = estimate * 10) %>%
+    dplyr::select(x, y, estimate)
+
+  raster_trend_data_clean <-
+    raster::rasterFromXYZ(
+      xyz = trend_data_clean,
+      crs = "+proj=longlat +datum=WGS84 +no_defs"
+    )
+
+  raster::writeRaster(
+    x = raster_trend_data_clean,
+    filename = path_result_trend(indicator),
+    format = "GTiff",
+    overwrite = TRUE
+  )
+}
+```
+
+```{r}
+trend_function_update(indicator = "PM2_5")
+trend_function_update(indicator = "co2")
+trend_function_update(indicator = "NDVI")
+trend_function_update(indicator = "nightlight")
+```
+
+## 2. Combine indicators
+
+```{r}
+PM2_5_trend <- raster::raster(check_file(path_result_trend("PM2_5")))
+co2_trend <- raster::raster(check_file(path_result_trend("co2")))
+nightlight_trend <- raster::raster(check_file(path_result_trend("nightlight")))
+NDVI_trend <- raster::raster(check_file(path_result_trend("NDVI")))
+
+new_extent <- raster::extent(-180, 180, -55.4, 74)
+
+co2_trend_crop <- raster::crop(co2_trend, new_extent)
+nightlight_trend_crop <- raster::crop(nightlight_trend, new_extent)
+NDVI_trend_crop <- raster::crop(NDVI_trend, new_extent)
+
+raster_stack_co2_nl_ndvi <- raster::stack(co2_trend_crop, nightlight_trend_crop, NDVI_trend_crop)
+names(raster_stack_co2_nl_ndvi) <- c("co2_trend", "nightlight_trend", "NDVI_trend")
+
+PM2_5_trend_crop <- raster::resample(PM2_5_trend, raster_stack_co2_nl_ndvi, method = "bilinear")
+
+raster_stack_all <- raster::stack(raster_stack_co2_nl_ndvi, PM2_5_trend_crop)
+names(raster_stack_all) <- c("co2_trend", "nightlight_trend", "NDVI_trend", "PM2_5_trend")
+
+rm(co2_trend_crop, nightlight_trend_crop, NDVI_trend_crop, PM2_5_trend_crop)
+rm(NDVI_trend, nightlight_trend, co2_trend, PM2_5_trend, raster_stack_co2_nl_ndvi)
+
+raster_stack_all_stars <- stars::st_as_stars(raster_stack_all)
+stars::write_stars(raster_stack_all_stars, file.path(dir_results, "raster_stack_all_update.tif"))
+```
+
+## 3. Classification of trend
+
+```{r}
+raster_stack_all <- raster::stack(check_file(file.path(dir_results, "raster_stack_all_update.tif")))
+
+raster_stack_all <- raster::rasterToPoints(raster_stack_all)
+raster_stack_all_df <- as.data.frame(raster_stack_all, xy = TRUE) %>%
+  tidyr::drop_na()
+
+raster_stack_all_df$co2_score <- ifelse(raster_stack_all_df$co2_trend <= 0, 1, 0)
+raster_stack_all_df$PM2_5_score <- ifelse(raster_stack_all_df$PM2_5_trend <= 0, 1, 0)
+raster_stack_all_df$nightlight_score <- ifelse(raster_stack_all_df$nightlight_trend > 0, 1, 0)
+raster_stack_all_df$NDVI_score <- ifelse(raster_stack_all_df$NDVI_trend > 0, 1, 0)
+
+raster_stack_all_df$score <-
+  raster_stack_all_df$co2_score +
+  raster_stack_all_df$nightlight_score +
+  raster_stack_all_df$NDVI_score +
+  raster_stack_all_df$PM2_5_score
+
+raster_stack_all_df$score <- as.factor(raster_stack_all_df$score)
+
+saveRDS(raster_stack_all_df, file = file.path(dir_results, "raster_stack_all_df_update.rds"))
+
+raster_score <- raster_stack_all_df %>%
+  dplyr::select(x, y, score) %>%
+  dplyr::mutate(score = as.numeric(as.character(score))) %>%
+  raster::rasterFromXYZ(xyz = ., crs = "+proj=longlat +datum=WGS84 +no_defs")
+
+raster::writeRaster(
+  x = raster_score,
+  filename = file.path(dir_results, "raster_score_update.tif"),
+  format = "GTiff",
+  overwrite = TRUE
+)
+```
+
+## 4. Plot raster score
+
+```{r}
+p_score <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = score)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_manual(
+    values = c("#e12729", "#f37324", "#f8cc1b", "#72b043", "#007f4e"),
+    name = "Classification",
+    labels = c("Very Bad", "Bad", "Medium", "Good", "Very Good")
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "score", x = NULL, y = NULL)
+
+tiff(file.path(dir_results_plots, "plot_score_update.tif"), width = 2500, height = 1000, units = "px", res = 300)
+print(p_score)
+dev.off()
+```
+
+```{r}
+p_co2 <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = as.factor(co2_score))) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_manual(
+    values = c("#e12729", "#72b043"),
+    name = "Trend",
+    labels = c("Increase", "Decline")
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "co2_score", x = NULL, y = NULL) +
+  ggplot2::ggtitle("CO2")
+
+p_PM25 <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = as.factor(PM2_5_score))) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_manual(
+    values = c("#e12729", "#72b043"),
+    name = "Trend",
+    labels = c("Increase", "Decline")
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "PM2_5_score", x = NULL, y = NULL) +
+  ggplot2::ggtitle("PM2.5")
+
+p_nightlight <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = as.factor(nightlight_score))) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_manual(
+    values = c("#e12729", "#72b043"),
+    name = "Trend",
+    labels = c("Decline", "Increase")
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "nightlight_score", x = NULL, y = NULL) +
+  ggplot2::ggtitle("Nightlight")
+
+p_NDVI <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = as.factor(NDVI_score))) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_manual(
+    values = c("#e12729", "#72b043"),
+    name = "Trend",
+    labels = c("Decline", "Increase")
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "NDVI_score", x = NULL, y = NULL) +
+  ggplot2::ggtitle("NDVI")
+```
+
+```{r}
+p_all <- cowplot::plot_grid(p_co2, p_PM25, p_nightlight, p_NDVI, ncol = 2, nrow = 2)
+
+tiff(file.path(dir_results_plots, "plot_4indicators_update.tif"), width = 5000, height = 2000, units = "px", res = 300)
+print(p_all)
+dev.off()
+```
+
+## 5. Plot trend of each indicator with exact value
+
+```{r}
+p_co2_value <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = co2_trend)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_viridis_c(option = "D") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "CO2 trend", x = NULL, y = NULL) +
+  ggplot2::ggtitle("CO2")
+
+p_PM25_value <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = PM2_5_trend)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_viridis_c(option = "D") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "PM2.5 trend", x = NULL, y = NULL) +
+  ggplot2::ggtitle("PM2.5")
+
+p_nightlight_value <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = nightlight_trend)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_viridis_c(option = "D", direction = -1) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "Nightlight trend", x = NULL, y = NULL) +
+  ggplot2::ggtitle("Nightlight")
+
+p_NDVI_value <- ggplot2::ggplot(data = raster_stack_all_df, ggplot2::aes(x = x, y = y, fill = NDVI_trend)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_fill_viridis_c(option = "D", direction = -1) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(fill = "NDVI trend", x = NULL, y = NULL) +
+  ggplot2::ggtitle("NDVI")
+```
+
+```{r}
+p_all_value <- cowplot::plot_grid(p_co2_value, p_PM25_value, p_nightlight_value, p_NDVI_value, ncol = 2, nrow = 2)
+
+tiff(file.path(dir_results_plots, "plot_4indicators_value_update.tif"), width = 5000, height = 2000, units = "px", res = 300)
+print(p_all_value)
+dev.off()
+```
+
+## 6. Category with 16 groups
+
+1. Population in 2019  
+2. Population in 2030 (SSP1–SSP5)  
+3. Category with 16 groups  
+4. Population totals and proportions  
+
+```{r}
+raster_stack_all_df <- readRDS(check_file(file.path(dir_results, "raster_stack_all_df_update.rds")))
+
+raster_stack_all_df <- raster_stack_all_df %>%
+  dplyr::mutate(
+    combined_category = paste0(co2_score, PM2_5_score, nightlight_score, NDVI_score),
+    combined_category = factor(
+      combined_category,
+      levels = c("0000", "1000", "0100", "0010", "0001", "1100", "1010", "1001",
+                 "0110", "0101", "0011", "1110", "1101", "1011", "0111", "1111")
+    ),
+    combined_type = as.integer(combined_category)
+  )
+
+raster_category <- raster_stack_all_df %>%
+  dplyr::select(x, y, combined_type) %>%
+  raster::rasterFromXYZ(xyz = ., crs = "+proj=longlat +datum=WGS84 +no_defs")
+
+raster::writeRaster(
+  x = raster_category,
+  filename = file.path(dir_plots, "raster_category_16_update.tif"),
+  format = "GTiff",
+  overwrite = TRUE
+)
+```
+
+```{r}
+year_data_df_2019 <- raster::stack(check_file(file.path(dir_plots, "landscan_global_UN_adjusted_2019.tif")))
+r <- year_data_df_2019
+
+aggregation_factor <- round(0.1 / raster::res(r)[1])
+
+r_aggregated <- raster::aggregate(r, fact = aggregation_factor, fun = sum, na.rm = TRUE)
+
+year_pop_2019_resample <- raster::resample(r_aggregated, raster_category, method = "ngb")
+
+print(raster::cellStats(year_pop_2019_resample, stat = sum))
+
+raster::writeRaster(
+  x = year_pop_2019_resample,
+  filename = file.path(dir_plots, "year_pop_2019_resample_UN_adjusted.tif"),
+  format = "GTiff",
+  overwrite = TRUE
+)
+
+for (i in 1:5) {
+  ssp_file <- file.path(dir_ssp_population, paste0("ssp", i, "_total_2030.nc4"))
+  year_pop_ssp_2030 <- raster::raster(check_file(ssp_file))
+
+  aggregation_factor_ssp <- round(0.1 / raster::res(year_pop_ssp_2030)[1])
+
+  year_pop_ssp_2030_0.1 <- raster::aggregate(
+    year_pop_ssp_2030,
+    fact = aggregation_factor_ssp,
+    fun = sum,
+    na.rm = TRUE
+  )
+
+  year_pop_ssp_2030_resample <- raster::resample(year_pop_ssp_2030_0.1, raster_category, method = "bilinear")
+
+  raster::writeRaster(
+    x = year_pop_ssp_2030_resample,
+    filename = file.path(dir_plots, paste0("year_pop_ssp", i, "_2030_resample.tif")),
+    format = "GTiff",
+    overwrite = TRUE
+  )
+}
+```
+
+```{r}
+pop_2019 <- raster::raster(check_file(file.path(dir_plots, "year_pop_2019_resample_UN_adjusted.tif")))
+
+pop_2030_ssp1 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp1_2030_resample.tif")))
+pop_2030_ssp2 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp2_2030_resample.tif")))
+pop_2030_ssp3 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp3_2030_resample.tif")))
+pop_2030_ssp4 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp4_2030_resample.tif")))
+pop_2030_ssp5 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp5_2030_resample.tif")))
+
+category_type <- raster::raster(check_file(file.path(dir_plots, "raster_category_16_update.tif")))
+
+raster_category_pop_2019_2030 <-
+  raster::stack(c(category_type, pop_2019, pop_2030_ssp1, pop_2030_ssp2, pop_2030_ssp3, pop_2030_ssp4, pop_2030_ssp5))
+
+names(raster_category_pop_2019_2030) <- c(
+  "category", "pop_2019", "pop_2030_ssp1", "pop_2030_ssp2",
+  "pop_2030_ssp3", "pop_2030_ssp4", "pop_2030_ssp5"
+)
+
+Fig3_df <- raster::as.data.frame(raster_category_pop_2019_2030, xy = TRUE) %>%
+  dplyr::filter(!is.na(category))
+
+saveRDS(Fig3_df, file.path(dir_plots, "Fig_df_update.rds"))
+
+Fig3 <- Fig3_df %>%
+  dplyr::mutate(category = as.factor(category)) %>%
+  dplyr::group_by(category) %>%
+  dplyr::summarise(
+    sum_pop_2019 = sum(pop_2019, na.rm = TRUE),
+    sum_pop_2030_ssp1 = sum(pop_2030_ssp1, na.rm = TRUE),
+    sum_pop_2030_ssp2 = sum(pop_2030_ssp2, na.rm = TRUE),
+    sum_pop_2030_ssp3 = sum(pop_2030_ssp3, na.rm = TRUE),
+    sum_pop_2030_ssp4 = sum(pop_2030_ssp4, na.rm = TRUE),
+    sum_pop_2030_ssp5 = sum(pop_2030_ssp5, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    proportion_2019 = round((sum_pop_2019 / sum(sum_pop_2019, na.rm = TRUE)) * 100, 2),
+    proportion_2030_ssp1 = round((sum_pop_2030_ssp1 / sum(sum_pop_2030_ssp1, na.rm = TRUE)) * 100, 2),
+    proportion_2030_ssp2 = round((sum_pop_2030_ssp2 / sum(sum_pop_2030_ssp2, na.rm = TRUE)) * 100, 2),
+    proportion_2030_ssp3 = round((sum_pop_2030_ssp3 / sum(sum_pop_2030_ssp3, na.rm = TRUE)) * 100, 2),
+    proportion_2030_ssp4 = round((sum_pop_2030_ssp4 / sum(sum_pop_2030_ssp4, na.rm = TRUE)) * 100, 2),
+    proportion_2030_ssp5 = round((sum_pop_2030_ssp5 / sum(sum_pop_2030_ssp5, na.rm = TRUE)) * 100, 2)
+  )
+
+write.csv(Fig3, file = file.path(dir_fig3, "Fig3_update_ssp1_5_update_UN_adjusted.csv"), row.names = FALSE)
+```
+
+## 7. Number and proportion of best and worst categories
+
+Rows include: global, continent, income group, and urban/rural.
+
+```{r}
+pop_2019 <- raster::raster(check_file(file.path(dir_plots, "year_pop_2019_resample_UN_adjusted.tif")))
+category_type <- raster::raster(check_file(file.path(dir_plots, "raster_category_16_update.tif")))
+urban_2019 <- raster::raster(check_file(file.path(dir_plots, "year_urban_2019_resample.tif")))
+income_group <- read.csv(check_file(file.path(dir_plots, "World_bank_income_group_2019.csv")))
+pop_2030 <- raster::raster(check_file(file.path(dir_plots, "year_pop_ssp2_2030_resample.tif")))
+
+raster_category_pop_urban <-
+  raster::stack(c(category_type, pop_2019, pop_2030, urban_2019))
+
+names(raster_category_pop_urban) <- c("category_type", "pop_2019", "pop_2030_ssp2", "urban_code_2019")
+
+raster_category_pop_urban <- raster::as.data.frame(raster_category_pop_urban, xy = TRUE) %>%
+  dplyr::mutate(
+    x = round(x, 2),
+    y = round(y, 2)
+  )
+```
+
+```{r}
+region_raster_df <- readRDS(check_file(file.path(dir_plots, "region_raster_df.rds"))) %>%
+  dplyr::mutate(
+    X = round(X, 2),
+    Y = round(Y, 2)
+  )
+
+sub_region_category_intersect <- raster_category_pop_urban %>%
+  dplyr::left_join(region_raster_df, by = c("x" = "X", "y" = "Y"))
+```
+
+```{r}
+table1_df <- sub_region_category_intersect %>%
+  dplyr::filter(!is.na(category_type)) %>%
+  dplyr::left_join(income_group, by = c("iso_a3" = "ISO3")) %>%
+  dplyr::mutate(
+    category_type = factor(category_type, levels = 1:16),
+    SUBREGION2 = factor(
+      SUBREGION2,
+      levels = c(
+        "Northern America", "Latin America and the Caribbean", "Northern Europe",
+        "Eastern Europe", "Western Europe", "Southern Europe", "Northern Africa",
+        "Sub-Saharan Africa", "South-eastern Asia", "Western Asia", "Central Asia",
+        "Southern Asia", "Eastern Asia", "Australia and New Zealand",
+        "Other regions in Oceania"
+      )
+    ),
+    REGION = factor(REGION, levels = c("Americas", "Europe", "Africa", "Asia", "Oceania")),
+    Income2019 = factor(Income2019, levels = c("H", "UM", "LM", "L")),
+    urban_2019 = dplyr::if_else(
+      urban_code_2019 == 30, "Urban centre",
+      dplyr::if_else(urban_code_2019 == 10, "Water", "Rural")
+    ),
+    urban_2019 = factor(urban_2019, levels = c("Urban centre", "Rural", "Water"))
+  )
+
+saveRDS(table1_df, file = file.path(dir_plots, "table1_df_updated.rds"))
+```
+
+```{r}
+df <- table1_df %>% tidyr::drop_na()
+
+summary_table <- df %>%
+  dplyr::mutate(Global = "Global") %>%
+  tidyr::pivot_longer(
+    cols = c("Global", "REGION", "Income2019", "urban_2019"),
+    names_to = "Category",
+    values_to = "Value"
+  ) %>%
+  dplyr::group_by(Category, Value, category_type) %>%
+  dplyr::summarise(Total_Population = sum(pop_2019, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::group_by(Category, Value) %>%
+  dplyr::mutate(
+    Total_Sum = sum(Total_Population, na.rm = TRUE),
+    Proportion = round(Total_Population / Total_Sum * 100, 2)
+  ) %>%
+  dplyr::ungroup() %>%
+  tidyr::pivot_wider(
+    names_from = category_type,
+    values_from = c(Total_Population, Proportion),
+    names_sep = "_"
+  )
+
+write.csv(summary_table, file = file.path(dir_table1, "summary_table1_update.csv"), row.names = FALSE)
+```
+
+## 8. Rank countries by best and worst categories
+
+A. Top countries by population in best category  
+B. Top countries by population in worst category  
+C. Top countries by proportion in best category  
+D. Top countries by proportion in worst category  
+
+```{r}
+table1_df <- readRDS(check_file(file.path(dir_plots, "table1_df_updated.rds")))
+
+Fig4_data <- table1_df %>%
+  dplyr::group_by(iso_a3, Country_name, category_type) %>%
+  dplyr::summarise(sum_pop = sum(pop_2019, na.rm = TRUE), .groups = "drop_last") %>%
+  dplyr::group_by(iso_a3, Country_name) %>%
+  dplyr::mutate(
+    proportion = sum_pop / sum(sum_pop, na.rm = TRUE),
+    proportion = round(proportion * 100, 2)
+  ) %>%
+  dplyr::ungroup()
+
+saveRDS(Fig4_data, file = file.path(dir_fig4, "Fig4_data_update.rds"))
+
+top15_best_numb <- Fig4_data %>%
+  dplyr::filter(category_type == 16) %>%
+  dplyr::arrange(dplyr::desc(sum_pop)) %>%
+  dplyr::slice(1:15)
+
+top15_worst_numb <- Fig4_data %>%
+  dplyr::filter(category_type == 1) %>%
+  dplyr::arrange(dplyr::desc(sum_pop)) %>%
+  dplyr::slice(1:15)
+
+top15_best_proportion <- Fig4_data %>%
+  dplyr::filter(category_type == 16) %>%
+  dplyr::arrange(dplyr::desc(proportion)) %>%
+  dplyr::slice(1:15)
+
+top15_worst_proportion <- Fig4_data %>%
+  dplyr::filter(category_type == 1) %>%
+  dplyr::arrange(dplyr::desc(proportion)) %>%
+  dplyr::slice(1:15)
+
+write.csv(top15_best_numb, file = file.path(dir_fig4, "top15_best_numb_update.csv"), row.names = FALSE)
+write.csv(top15_worst_numb, file = file.path(dir_fig4, "top15_worst_numb_update.csv"), row.names = FALSE)
+write.csv(top15_best_proportion, file = file.path(dir_fig4, "top15_best_proportion_update.csv"), row.names = FALSE)
+write.csv(top15_worst_proportion, file = file.path(dir_fig4, "top15_worst_proportion_update.csv"), row.names = FALSE)
+```
+
+## 9. Grid-cell Kendall correlation across indicators
+
+```{r}
+grid_cell_correlation <- function(
+  var1,
+  var2,
+  grid_all_df,
+  use_diff = TRUE,
+  output_dir = dir_results_plots,
+  raster_dir = dir_results_corr
+) {
+
+  diff_tag <- if (use_diff) "diff" else "raw"
+  pair_label <- paste0(var1, "_vs_", var2, "_", diff_tag)
+  crs_wgs84 <- "+proj=longlat +datum=WGS84 +no_defs"
+
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(raster_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(dir_results_data, showWarnings = FALSE, recursive = TRUE)
+
+  cell_cor <- grid_all_df %>%
+    dplyr::select(x, y, year, dplyr::all_of(c(var1, var2))) %>%
+    tidyr::drop_na() %>%
+    dplyr::arrange(x, y, year) %>%
+    tidyr::nest(data = -c(x, y)) %>%
+    dplyr::mutate(
+      ct = furrr::future_map(
+        data,
+        function(d) {
+          v1 <- if (use_diff) diff(d[[var1]]) else d[[var1]]
+          v2 <- if (use_diff) diff(d[[var2]]) else d[[var2]]
+
+          if (length(v1) < 2 || length(v2) < 2) {
+            return(list(estimate = NA_real_, p.value = NA_real_))
+          }
+
+          test_res <- tryCatch(
+            stats::cor.test(v1, v2, method = "kendall"),
+            error = function(e) NULL
+          )
+
+          if (is.null(test_res)) {
+            list(estimate = NA_real_, p.value = NA_real_)
+          } else {
+            list(
+              estimate = unname(test_res$estimate),
+              p.value = test_res$p.value
+            )
+          }
+        },
+        .options = furrr::furrr_options(seed = TRUE)
+      ),
+      tau = purrr::map_dbl(ct, ~ .x$estimate),
+      p_value = purrr::map_dbl(ct, ~ .x$p.value)
+    ) %>%
+    dplyr::select(x, y, tau, p_value)
+
+  saveRDS(cell_cor, file.path(dir_results_data, paste0("cell_cor_", pair_label, ".rds")))
+
+  raster::writeRaster(
+    raster::rasterFromXYZ(cell_cor[, c("x", "y", "tau")], crs = crs_wgs84),
+    file.path(raster_dir, paste0("tau_", pair_label, ".tif")),
+    overwrite = TRUE
+  )
+
+  raster::writeRaster(
+    raster::rasterFromXYZ(cell_cor[, c("x", "y", "p_value")], crs = crs_wgs84),
+    file.path(raster_dir, paste0("pval_", pair_label, ".tif")),
+    overwrite = TRUE
+  )
+
+  p_tau <- ggplot2::ggplot(cell_cor, ggplot2::aes(x, y, fill = tau)) +
+    ggplot2::geom_raster() +
+    ggplot2::coord_fixed() +
+    ggplot2::scale_fill_viridis_c(option = "D", limits = c(-1, 1), name = "tau") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = paste0(var1, " vs ", var2), x = NULL, y = NULL)
+
+  p_pval <- ggplot2::ggplot(cell_cor, ggplot2::aes(x, y, fill = p_value)) +
+    ggplot2::geom_raster() +
+    ggplot2::coord_fixed() +
+    ggplot2::scale_fill_viridis_c(option = "B", direction = -1, name = "p-value") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = paste0(var1, " vs ", var2), x = NULL, y = NULL)
+
+  tiff(file.path(output_dir, paste0("cor_tau_", pair_label, ".tif")), 2500, 1000, res = 300)
+  print(p_tau)
+  dev.off()
+
+  tiff(file.path(output_dir, paste0("cor_pval_", pair_label, ".tif")), 2500, 1000, res = 300)
+  print(p_pval)
+  dev.off()
+
+  list(tau_map = p_tau, pval_map = p_pval, data = cell_cor)
+}
+
+run_grid_correlations <- function(
+  indicators = c("PM2_5", "co2", "nightlight", "NDVI"),
+  output_dir = dir_results_plots
+) {
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  n_workers <- max(1L, future::availableCores() - 1L)
+  future::plan(future::multisession, workers = n_workers)
+
+  grid_list <- lapply(indicators, function(ind) {
+    df <- readRDS(check_file(path_grid(ind)))
+    df <- dplyr::mutate(df, x = round(x, 2), y = round(y, 2))
+    names(df)[names(df) == "value"] <- ind
+    df
+  })
+
+  grid_all_df <- Reduce(function(a, b) dplyr::inner_join(a, b, by = c("x", "y", "year")), grid_list)
+  pairs <- combn(indicators, 2, simplify = FALSE)
+
+  run_one <- function(use_diff) {
+    tag <- if (use_diff) "diff" else "raw"
+
+    res <- lapply(pairs, function(p) {
+      grid_cell_correlation(p[1], p[2], grid_all_df, use_diff, output_dir)
+    })
+
+    p_tau_all <- cowplot::plot_grid(plotlist = lapply(res, `[[`, "tau_map"), ncol = 2)
+    tiff(file.path(output_dir, paste0("cor_tau_all_pairs_", tag, ".tif")), 5000, 3000, res = 300)
+    print(p_tau_all)
+    dev.off()
+
+    p_pval_all <- cowplot::plot_grid(plotlist = lapply(res, `[[`, "pval_map"), ncol = 2)
+    tiff(file.path(output_dir, paste0("cor_pval_all_pairs_", tag, ".tif")), 5000, 3000, res = 300)
+    print(p_pval_all)
+    dev.off()
+
+    res
+  }
+
+  list(
+    diff = run_one(TRUE),
+    raw = run_one(FALSE)
+  )
+}
+
+cor_results <- run_grid_correlations()
+```
+
+## 10. Regional correlation analysis
+
+```{r}
+region_lookup <- readRDS(check_file(file.path(dir_plots, "region_raster_df.rds"))) %>%
+  dplyr::mutate(
+    X = round(X, 2),
+    Y = round(Y, 2),
+    SUBREGION2 = ifelse(
+      SUBREGION2 %in% c("Australia and New Zealand", "Other regions in Oceania"),
+      "Oceania",
+      SUBREGION2
+    )
+  )
+
+pop_raster_df <- raster::raster(check_file(file.path(dir_plots, "year_pop_2019_resample_UN_adjusted.tif"))) %>%
+  raster::as.data.frame(xy = TRUE) %>%
+  dplyr::rename(pop = 3) %>%
+  dplyr::mutate(x = round(x, 2), y = round(y, 2))
+
+indicators <- c("PM2_5", "co2", "nightlight", "NDVI")
+
+regional_means_list <- lapply(indicators, function(ind) {
+  df <- readRDS(check_file(path_grid(ind))) %>%
+    dplyr::mutate(x = round(x, 2), y = round(y, 2)) %>%
+    dplyr::left_join(region_lookup, by = c("x" = "X", "y" = "Y")) %>%
+    dplyr::left_join(pop_raster_df, by = c("x", "y"))
+
+  simple <- df %>%
+    dplyr::group_by(SUBREGION2, year) %>%
+    dplyr::summarise(!!ind := mean(value, na.rm = TRUE), .groups = "drop")
+
+  weighted <- df %>%
+    dplyr::filter(pop > 0) %>%
+    dplyr::group_by(SUBREGION2, year) %>%
+    dplyr::summarise(!!ind := stats::weighted.mean(value, pop, na.rm = TRUE), .groups = "drop")
+
+  list(simple = simple, weighted = weighted)
+})
+
+names(regional_means_list) <- indicators
+
+merge_ts <- function(type) {
+  Reduce(
+    function(a, b) dplyr::inner_join(a, b, by = c("SUBREGION2", "year")),
+    lapply(indicators, function(i) regional_means_list[[i]][[type]])
+  )
+}
+
+regional_ts_simple <- merge_ts("simple")
+regional_ts_weighted <- merge_ts("weighted")
+
+regional_cor_table <- function(regional_ts, indicators, use_diff) {
+  pairs <- combn(indicators, 2, simplify = FALSE)
+
+  res <- lapply(pairs, function(p) {
+    var1 <- p[1]
+    var2 <- p[2]
+
+    regional_ts %>%
+      dplyr::arrange(SUBREGION2, year) %>%
+      tidyr::nest(data = -SUBREGION2) %>%
+      dplyr::mutate(
+        ct = purrr::map(data, function(d) {
+          v1 <- if (use_diff) diff(d[[var1]]) else d[[var1]]
+          v2 <- if (use_diff) diff(d[[var2]]) else d[[var2]]
+
+          if (length(v1) < 2) return(list(estimate = NA, p.value = NA))
+
+          test <- tryCatch(stats::cor.test(v1, v2, method = "kendall"), error = function(e) NULL)
+
+          if (is.null(test)) list(estimate = NA, p.value = NA)
+          else list(estimate = unname(test$estimate), p.value = test$p.value)
+        }),
+        tau = purrr::map_dbl(ct, ~ .x$estimate),
+        p_value = purrr::map_dbl(ct, ~ .x$p.value)
+      ) %>%
+      dplyr::select(SUBREGION2, tau, p_value) %>%
+      dplyr::rename(
+        !!paste0(var1, "_vs_", var2, "_tau") := tau,
+        !!paste0(var1, "_vs_", var2, "_p_value") := p_value
+      )
+  })
+
+  Reduce(function(a, b) dplyr::left_join(a, b, by = "SUBREGION2"), res)
+}
+
+result_simple_raw <- regional_cor_table(regional_ts_simple, indicators, FALSE)
+result_simple_diff <- regional_cor_table(regional_ts_simple, indicators, TRUE)
+result_weighted_raw <- regional_cor_table(regional_ts_weighted, indicators, FALSE)
+result_weighted_diff <- regional_cor_table(regional_ts_weighted, indicators, TRUE)
+
+write.csv(result_simple_raw, file.path(dir_results_data, "regional_cor_simple_raw.csv"), row.names = FALSE)
+write.csv(result_simple_diff, file.path(dir_results_data, "regional_cor_simple_diff.csv"), row.names = FALSE)
+write.csv(result_weighted_raw, file.path(dir_results_data, "regional_cor_weighted_raw.csv"), row.names = FALSE)
+write.csv(result_weighted_diff, file.path(dir_results_data, "regional_cor_weighted_diff.csv"), row.names = FALSE)
+
+print(result_simple_raw)
+print(result_weighted_diff)
+```
+
+## 11. Kendall's tau between sustainability trend pattern and GDP metrics
+
+```{r}
+input_rds <- check_file(file.path(dir_corr, "Sustainable_trend_pattern_with_GDP_extracted.rds"))
+
+output_dir <- file.path(dir_corr, "Analysis_3_Kendall_tau_outputs")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+output_grid_rds <- file.path(output_dir, "Gridcell_data_for_mapping_and_statistics.rds")
+output_excel <- file.path(output_dir, "Kendall_tau_results_sustainability_vs_GDP.xlsx")
+output_csv <- file.path(output_dir, "Kendall_tau_results_sustainability_vs_GDP.csv")
+output_rds <- file.path(output_dir, "Kendall_tau_results_sustainability_vs_GDP.rds")
+
+df <- readRDS(input_rds)
+
+cat("Data loaded successfully.\n")
+cat("Columns in the dataset:\n")
+print(names(df))
+
+required_cols <- c(
+  "x",
+  "y",
+  "name",
+  "Pattern_code",
+  "GDP_per_capita_2000",
+  "GDP_per_capita_2019",
+  "GDP_per_capita_mean_2000_2019",
+  "GDP_per_capita_trend_2000_2019_pct"
+)
+
+missing_cols <- setdiff(required_cols, names(df))
+if (length(missing_cols) > 0) {
+  stop(
+    "The following required columns are missing:\n",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+valid_levels <- c("SD", "MD", "MT", "MI", "SI")
+
+df_clean <- df %>%
+  dplyr::mutate(
+    x = as.numeric(x),
+    y = as.numeric(y),
+    name = toupper(trimws(as.character(name))),
+    Pattern_code = as.integer(Pattern_code),
+    GDP_per_capita_2000 = as.numeric(GDP_per_capita_2000),
+    GDP_per_capita_2019 = as.numeric(GDP_per_capita_2019),
+    GDP_per_capita_mean_2000_2019 = as.numeric(GDP_per_capita_mean_2000_2019),
+    GDP_per_capita_trend_2000_2019_pct = as.numeric(GDP_per_capita_trend_2000_2019_pct)
+  ) %>%
+  dplyr::filter(
+    name %in% valid_levels,
+    Pattern_code %in% 1:5
+  )
+
+cat("\nNumber of rows after cleaning:", nrow(df_clean), "\n")
+
+gridcell_data <- df_clean %>%
+  dplyr::select(
+    x, y, name, Pattern_code,
+    GDP_per_capita_2000,
+    GDP_per_capita_2019,
+    GDP_per_capita_mean_2000_2019,
+    GDP_per_capita_trend_2000_2019_pct
+  )
+
+saveRDS(gridcell_data, output_grid_rds)
+
+analysis_vars <- list(
+  list(var = "GDP_per_capita_2000", label = "GDP per capita in 2000"),
+  list(var = "GDP_per_capita_2019", label = "GDP per capita in 2019"),
+  list(var = "GDP_per_capita_mean_2000_2019", label = "Mean GDP per capita, 2000-2019"),
+  list(var = "GDP_per_capita_trend_2000_2019_pct", label = "Trend in GDP per capita, 2000-2019 (%/year)")
+)
+
+run_kendall_fast <- function(data, xvar, yvar = "Pattern_code", label_text = NULL) {
+  sub <- data %>%
+    dplyr::filter(!is.na(.data[[xvar]]), !is.na(.data[[yvar]]))
+
+  n_obs <- nrow(sub)
+
+  if (n_obs == 0) {
+    return(data.frame(
+      Variable = ifelse(is.null(label_text), xvar, label_text),
+      Variable_name = xvar,
+      N = 0,
+      Kendall_tau = NA_real_,
+      P_value = NA_real_,
+      Statistic_S = NA_real_,
+      Method = "Kendall::Kendall",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  x <- sub[[xvar]]
+  y <- sub[[yvar]]
+
+  kt <- Kendall::Kendall(x, y)
+
+  data.frame(
+    Variable = ifelse(is.null(label_text), xvar, label_text),
+    Variable_name = xvar,
+    N = n_obs,
+    Kendall_tau = as.numeric(kt$tau),
+    P_value = as.numeric(kt$sl),
+    Statistic_S = as.numeric(kt$S),
+    Method = "Kendall::Kendall",
+    stringsAsFactors = FALSE
+  )
+}
+
+cat("\nRunning 4 Kendall tau analyses...\n")
+
+results_list <- lapply(seq_along(analysis_vars), function(i) {
+  item <- analysis_vars[[i]]
+  cat("  [", i, "/4] Processing:", item$var, "\n", sep = "")
+
+  run_kendall_fast(
+    data = df_clean,
+    xvar = item$var,
+    yvar = "Pattern_code",
+    label_text = item$label
+  )
+})
+
+results_df <- dplyr::bind_rows(results_list) %>%
+  dplyr::mutate(
+    Direction = dplyr::case_when(
+      is.na(Kendall_tau) ~ NA_character_,
+      Kendall_tau > 0 ~ "Positive",
+      Kendall_tau < 0 ~ "Negative",
+      Kendall_tau == 0 ~ "Zero"
+    ),
+    Significance = dplyr::case_when(
+      is.na(P_value) ~ NA_character_,
+      P_value < 0.001 ~ "p < 0.001",
+      P_value < 0.01 ~ "p < 0.01",
+      P_value < 0.05 ~ "p < 0.05",
+      TRUE ~ "Not significant"
+    )
+  )
+
+cat("\n============================================\n")
+cat("Kendall tau results:\n")
+print(results_df)
+cat("============================================\n")
+
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "Kendall_results")
+openxlsx::writeData(wb, "Kendall_results", results_df)
+
+openxlsx::addWorksheet(wb, "README")
+openxlsx::writeData(
+  wb, "README",
+  data.frame(
+    Item = c(
+      "Input file",
+      "Grid-cell output",
+      "Outcome variable",
+      "Outcome coding",
+      "Predictor variables",
+      "Method",
+      "Important note"
+    ),
+    Description = c(
+      basename(input_rds),
+      basename(output_grid_rds),
+      "Sustainable trend pattern",
+      "Pattern_code: SD=1, MD=2, MT=3, MI=4, SI=5",
+      "GDP_per_capita_2000; GDP_per_capita_2019; GDP_per_capita_mean_2000_2019; GDP_per_capita_trend_2000_2019_pct",
+      "Kendall::Kendall",
+      "Tau and p-value are global statistics for all valid grid cells, not per-grid-cell values. Per-grid-cell data are saved separately for later mapping."
+    ),
+    stringsAsFactors = FALSE
+  )
+)
+
+openxlsx::saveWorkbook(wb, output_excel, overwrite = TRUE)
+
+write.csv(results_df, output_csv, row.names = FALSE, fileEncoding = "UTF-8")
+saveRDS(results_df, output_rds)
+
+cat("\nAll Kendall tau analyses completed successfully.\n")
+cat("Full grid-cell dataset (.rds) saved to:\n", output_grid_rds, "\n")
+cat("Summary Excel saved to:\n", output_excel, "\n")
+cat("Summary CSV saved to:\n", output_csv, "\n")
+cat("Summary RDS saved to:\n", output_rds, "\n")
+```
+
+## 12. Bar plot of Kendall's tau values
+
+```{r}
+input_rds <- check_file(file.path(dir_corr, "Analysis_3_Kendall_tau_outputs", "Kendall_tau_results_sustainability_vs_GDP.rds"))
+
+output_dir <- file.path(dir_corr, "Analysis_4_tau_barplot_outputs")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+output_png <- file.path(output_dir, "Barplot_4_Kendall_tau_values_with_pvalues.png")
+output_pdf <- file.path(output_dir, "Barplot_4_Kendall_tau_values_with_pvalues.pdf")
+output_csv <- file.path(output_dir, "Barplot_4_Kendall_tau_values_with_pvalues_data.csv")
+output_rds <- file.path(output_dir, "Barplot_4_Kendall_tau_values_with_pvalues_data.rds")
+
+tau_df <- readRDS(input_rds)
+
+cat("Kendall tau result file loaded successfully.\n")
+cat("Columns in the dataset:\n")
+print(names(tau_df))
+
+required_cols <- c("Variable_name", "Variable", "Kendall_tau", "P_value", "Direction", "Significance")
+missing_cols <- setdiff(required_cols, names(tau_df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "The following required columns are missing in the Kendall tau results file:\n",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+plot_df <- tau_df %>%
+  dplyr::filter(
+    Variable_name %in% c(
+      "GDP_per_capita_2000",
+      "GDP_per_capita_2019",
+      "GDP_per_capita_mean_2000_2019",
+      "GDP_per_capita_trend_2000_2019_pct"
+    )
+  ) %>%
+  dplyr::mutate(
+    Variable_plot = dplyr::case_when(
+      Variable_name == "GDP_per_capita_2000" ~ "GDP per capita\nin 2000",
+      Variable_name == "GDP_per_capita_2019" ~ "GDP per capita\nin 2019",
+      Variable_name == "GDP_per_capita_mean_2000_2019" ~ "Mean GDP per capita\n2000–2019",
+      Variable_name == "GDP_per_capita_trend_2000_2019_pct" ~ "Trend in GDP per capita\n2000–2019"
+    ),
+    Variable_plot = factor(
+      Variable_plot,
+      levels = c(
+        "GDP per capita\nin 2000",
+        "GDP per capita\nin 2019",
+        "Mean GDP per capita\n2000–2019",
+        "Trend in GDP per capita\n2000–2019"
+      )
+    ),
+    tau_label = sprintf("%.3f", Kendall_tau),
+    p_label = ifelse(
+      is.na(P_value),
+      NA_character_,
+      ifelse(P_value < 0.001, "p<0.001", paste0("p=", sprintf("%.3f", P_value)))
+    )
+  ) %>%
+  dplyr::arrange(Variable_plot)
+
+if (nrow(plot_df) != 4) {
+  stop("Expected 4 rows for plotting, but found: ", nrow(plot_df))
+}
+
+cat("\nData used for plotting:\n")
+print(plot_df)
+
+y_min <- min(0, min(plot_df$Kendall_tau, na.rm = TRUE) * 1.25)
+y_max <- max(0, max(plot_df$Kendall_tau, na.rm = TRUE) * 1.25)
+y_range <- y_max - y_min
+
+plot_df <- plot_df %>%
+  dplyr::mutate(
+    tau_label_y = ifelse(
+      Kendall_tau >= 0,
+      Kendall_tau + 0.02 * y_range,
+      Kendall_tau - 0.04 * y_range
+    ),
+    tau_vjust = ifelse(Kendall_tau >= 0, 0, 1),
+    p_label_y = ifelse(
+      Kendall_tau >= 0,
+      0 - 0.035 * y_range,
+      0 + 0.035 * y_range
+    )
+  )
+
+bar_color <- "#7588F7"
+p_text_color <- "black"
+
+p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = Variable_plot, y = Kendall_tau)) +
+  ggplot2::geom_col(
+    width = 0.62,
+    fill = bar_color,
+    colour = bar_color
+  ) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = 0.5, colour = "black") +
+  ggplot2::geom_text(
+    ggplot2::aes(y = tau_label_y, label = tau_label, vjust = tau_vjust),
+    size = 4
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(y = p_label_y, label = p_label),
+    colour = p_text_color,
+    size = 4
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Kendall's tau"
+  ) +
+  ggplot2::coord_cartesian(ylim = c(y_min, y_max), clip = "off") +
+  ggplot2::theme_bw(base_size = 13) +
+  ggplot2::theme(
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(size = 11, colour = "black", lineheight = 0.95),
+    axis.text.y = ggplot2::element_text(size = 11, colour = "black"),
+    axis.title.y = ggplot2::element_text(size = 13),
+    axis.ticks = ggplot2::element_line(linewidth = 0.4),
+    axis.ticks.length = grid::unit(-0.15, "cm"),
+    plot.margin = ggplot2::margin(8, 8, 8, 8)
+  )
+
+ggplot2::ggsave(output_png, p, width = 8.5, height = 5.8, dpi = 600, bg = "white")
+ggplot2::ggsave(output_pdf, p, width = 8.5, height = 5.8, bg = "white")
+
+write.csv(plot_df, output_csv, row.names = FALSE, fileEncoding = "UTF-8")
+saveRDS(plot_df, output_rds)
+
+cat("\nBar plot with p-values created successfully.\n")
+cat("PNG saved to:\n", output_png, "\n")
+cat("PDF saved to:\n", output_pdf, "\n")
+cat("Plot data CSV saved to:\n", output_csv, "\n")
+cat("Plot data RDS saved to:\n", output_rds, "\n")
+```
+
+## 13. Kendall by country and by region
+
+```{r}
+data_dir <- dir_corr
+
+input_main_rds <- check_file(file.path(data_dir, "Sustainable_trend_pattern_with_GDP_extracted.rds"))
+input_info_rds <- check_file(file.path(data_dir, "table1_df_updated_20250307.rds"))
+
+output_dir <- file.path(data_dir, "Analysis_9_Kendall_by_country_and_region")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+output_excel <- file.path(output_dir, "Kendall_by_country_and_region.xlsx")
+output_country_csv <- file.path(output_dir, "Kendall_by_country.csv")
+output_region_csv <- file.path(output_dir, "Kendall_by_region.csv")
+output_merged_rds <- file.path(output_dir, "Merged_data_for_country_region_Kendall.rds")
+output_results_rds <- file.path(output_dir, "Kendall_by_country_and_region.rds")
+
+main_df <- readRDS(input_main_rds)
+info_df <- readRDS(input_info_rds)
+
+cat("Main data loaded successfully.\n")
+cat("Main data columns:\n")
+print(names(main_df))
+
+cat("\nInfo data loaded successfully.\n")
+cat("Info data columns:\n")
+print(names(info_df))
+
+find_first_existing_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "NaN", "NULL")] <- NA
+  x
+}
+
+normalize_region_14 <- function(x) {
+  x0 <- clean_text(x)
+  x1 <- tolower(x0)
+
+  out <- rep(NA_character_, length(x1))
+
+  out[grepl("central asia", x1)] <- "Central Asia"
+  out[grepl("eastern asia", x1)] <- "Eastern Asia"
+  out[grepl("eastern europe", x1)] <- "Eastern Europe"
+  out[grepl("latin america", x1) | grepl("caribbean", x1)] <- "Latin America and the Caribbean"
+  out[grepl("northern africa", x1)] <- "Northern Africa"
+  out[grepl("northern america", x1)] <- "Northern America"
+  out[grepl("northern europe", x1)] <- "Northern Europe"
+  out[grepl("south-eastern asia", x1) | grepl("southeastern asia", x1) | grepl("south eastern asia", x1)] <- "South-eastern Asia"
+  out[grepl("southern asia", x1)] <- "Southern Asia"
+  out[grepl("southern europe", x1)] <- "Southern Europe"
+  out[grepl("sub-saharan africa", x1) | grepl("sub saharan africa", x1)] <- "Sub-Saharan Africa"
+  out[grepl("western asia", x1)] <- "Western Asia"
+  out[grepl("western europe", x1)] <- "Western Europe"
+
+  out[grepl("oceania", x1)] <- "Oceania"
+  out[grepl("australia", x1)] <- "Oceania"
+  out[grepl("new zealand", x1)] <- "Oceania"
+  out[grepl("other oceania", x1)] <- "Oceania"
+  out[grepl("melanesia", x1)] <- "Oceania"
+  out[grepl("micronesia", x1)] <- "Oceania"
+  out[grepl("polynesia", x1)] <- "Oceania"
+
+  out
+}
+
+make_na_result <- function(group_type, group_name, xvar, n_obs, status_text) {
+  data.frame(
+    Group_type = group_type,
+    Group_name = group_name,
+    Variable_name = xvar,
+    N = n_obs,
+    Kendall_tau = NA_real_,
+    P_value = NA_real_,
+    Direction = NA_character_,
+    Significance = NA_character_,
+    Status = status_text,
+    stringsAsFactors = FALSE
+  )
+}
+
+run_kendall_one_group <- function(
+  data,
+  xvar,
+  yvar = "Pattern_code",
+  group_name = NA_character_,
+  group_type = NA_character_,
+  min_n = 10,
+  min_unique_x = 3,
+  min_unique_y = 2
+) {
+  sub <- data[, c(xvar, yvar), drop = FALSE]
+  sub <- sub[!is.na(sub[[xvar]]) & !is.na(sub[[yvar]]), , drop = FALSE]
+
+  n_obs <- nrow(sub)
+
+  if (n_obs < min_n) {
+    return(make_na_result(group_type, group_name, xvar, n_obs, paste0("Skipped: N < ", min_n)))
+  }
+
+  ux <- length(unique(sub[[xvar]]))
+  if (ux < min_unique_x) {
+    return(make_na_result(group_type, group_name, xvar, n_obs, paste0("Skipped: unique x < ", min_unique_x)))
+  }
+
+  uy <- length(unique(sub[[yvar]]))
+  if (uy < min_unique_y) {
+    return(make_na_result(group_type, group_name, xvar, n_obs, paste0("Skipped: unique y < ", min_unique_y)))
+  }
+
+  warning_msg <- NULL
+
+  kt <- tryCatch(
+    withCallingHandlers(
+      Kendall::Kendall(sub[[xvar]], sub[[yvar]]),
+      warning = function(w) {
+        warning_msg <<- conditionMessage(w)
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      return(structure(list(.error = conditionMessage(e)), class = "kendall_error"))
+    }
+  )
+
+  if (inherits(kt, "kendall_error")) {
+    return(make_na_result(group_type, group_name, xvar, n_obs, paste0("Kendall error: ", kt$.error)))
+  }
+
+  tau_val <- suppressWarnings(as.numeric(kt$tau))
+  p_val <- suppressWarnings(as.numeric(kt$sl))
+
+  if (!is.finite(tau_val) || !is.finite(p_val)) {
+    return(make_na_result(group_type, group_name, xvar, n_obs, "Kendall returned non-finite result"))
+  }
+
+  status_text <- if (is.null(warning_msg)) "OK" else paste0("Warning captured: ", warning_msg)
+
+  data.frame(
+    Group_type = group_type,
+    Group_name = group_name,
+    Variable_name = xvar,
+    N = n_obs,
+    Kendall_tau = tau_val,
+    P_value = p_val,
+    Direction = ifelse(tau_val > 0, "Positive", ifelse(tau_val < 0, "Negative", "Zero")),
+    Significance = ifelse(
+      p_val < 0.001, "p < 0.001",
+      ifelse(p_val < 0.01, "p < 0.01", ifelse(p_val < 0.05, "p < 0.05", "Not significant"))
+    ),
+    Status = status_text,
+    stringsAsFactors = FALSE
+  )
+}
+
+main_x_col <- find_first_existing_col(main_df, c("x", "lon", "longitude", "X", "Lon", "Longitude"))
+main_y_col <- find_first_existing_col(main_df, c("y", "lat", "latitude", "Y", "Lat", "Latitude"))
+
+info_x_col <- find_first_existing_col(info_df, c("x", "lon", "longitude", "X", "Lon", "Longitude"))
+info_y_col <- find_first_existing_col(info_df, c("y", "lat", "latitude", "Y", "Lat", "Latitude"))
+
+pattern_col <- find_first_existing_col(main_df, c("name", "pattern", "Pattern", "Sustainable_trend_pattern", "trend_pattern"))
+pattern_code_col <- find_first_existing_col(main_df, c("Pattern_code", "pattern_code", "code", "Code"))
+
+country_col <- find_first_existing_col(
+  info_df,
+  c("Country", "country", "country_name", "Country_name", "NAME_0", "admin0", "nation", "Nation")
+)
+
+region_col <- "SUBREGION2"
+
+cat("\nDetected columns:\n")
+cat("main_x_col =", main_x_col, "\n")
+cat("main_y_col =", main_y_col, "\n")
+cat("info_x_col =", info_x_col, "\n")
+cat("info_y_col =", info_y_col, "\n")
+cat("pattern_col =", pattern_col, "\n")
+cat("pattern_code_col =", pattern_code_col, "\n")
+cat("country_col =", country_col, "\n")
+cat("region_col =", region_col, "\n")
+
+if (is.na(main_x_col) || is.na(main_y_col)) stop("Could not detect x/y columns in main_df.")
+if (is.na(info_x_col) || is.na(info_y_col)) stop("Could not detect x/y columns in info_df.")
+if (is.na(pattern_col)) stop("Could not detect Sustainable trend pattern column in main_df.")
+if (is.na(country_col)) stop("Could not detect country column in info_df.")
+if (!(region_col %in% names(info_df))) stop("The fixed region column SUBREGION2 does not exist in info_df.")
+
+analysis_vars <- c(
+  "GDP_per_capita_2000",
+  "GDP_per_capita_2019",
+  "GDP_per_capita_mean_2000_2019",
+  "GDP_per_capita_trend_2000_2019_pct"
+)
+
+missing_gdp_cols <- analysis_vars[!analysis_vars %in% names(main_df)]
+if (length(missing_gdp_cols) > 0) {
+  stop(
+    "The following GDP columns are missing in main_df:\n",
+    paste(missing_gdp_cols, collapse = ", ")
+  )
+}
+
+main_df[[main_x_col]] <- as.numeric(main_df[[main_x_col]])
+main_df[[main_y_col]] <- as.numeric(main_df[[main_y_col]])
+
+main_df[[pattern_col]] <- clean_text(main_df[[pattern_col]])
+main_df[[pattern_col]] <- toupper(main_df[[pattern_col]])
+
+for (v in analysis_vars) {
+  main_df[[v]] <- as.numeric(main_df[[v]])
+}
+
+if (!is.na(pattern_code_col) && pattern_code_col %in% names(main_df)) {
+  main_df$Pattern_code <- as.integer(main_df[[pattern_code_col]])
+} else {
+  main_df$Pattern_code <- ifelse(
+    main_df[[pattern_col]] == "SD", 1,
+    ifelse(
+      main_df[[pattern_col]] == "MD", 2,
+      ifelse(
+        main_df[[pattern_col]] == "MT", 3,
+        ifelse(main_df[[pattern_col]] == "MI", 4, ifelse(main_df[[pattern_col]] == "SI", 5, NA))
+      )
+    )
+  )
+}
+
+main_df <- main_df[!is.na(main_df$Pattern_code) & main_df$Pattern_code %in% 1:5, , drop = FALSE]
+
+main_df$x_merge <- round(main_df[[main_x_col]], 6)
+main_df$y_merge <- round(main_df[[main_y_col]], 6)
+
+info_df[[info_x_col]] <- as.numeric(info_df[[info_x_col]])
+info_df[[info_y_col]] <- as.numeric(info_df[[info_y_col]])
+
+info_df$Country_name <- clean_text(info_df[[country_col]])
+info_df$Region_raw <- clean_text(info_df[[region_col]])
+info_df$Region_14 <- normalize_region_14(info_df$Region_raw)
+
+info_df$x_merge <- round(info_df[[info_x_col]], 6)
+info_df$y_merge <- round(info_df[[info_y_col]], 6)
+
+info_keep <- info_df[, c("x_merge", "y_merge", "Country_name", "Region_raw", "Region_14"), drop = FALSE]
+info_keep <- unique(info_keep)
+
+merged_df <- merge(main_df, info_keep, by = c("x_merge", "y_merge"), all.x = TRUE)
+
+cat("\nMerged data rows:", nrow(merged_df), "\n")
+cat("Rows with country info:", sum(!is.na(merged_df$Country_name)), "\n")
+cat("Rows with 14-region info:", sum(!is.na(merged_df$Region_14)), "\n")
+
+saveRDS(merged_df, output_merged_rds)
+
+country_df <- merged_df[!is.na(merged_df$Country_name), , drop = FALSE]
+country_names <- sort(unique(country_df$Country_name))
+
+country_results_list <- list()
+counter <- 1
+
+for (ct in country_names) {
+  sub_ct <- country_df[country_df$Country_name == ct, , drop = FALSE]
+
+  for (v in analysis_vars) {
+    country_results_list[[counter]] <- run_kendall_one_group(
+      data = sub_ct,
+      xvar = v,
+      yvar = "Pattern_code",
+      group_name = ct,
+      group_type = "Country",
+      min_n = 10,
+      min_unique_x = 3,
+      min_unique_y = 2
+    )
+    counter <- counter + 1
+  }
+}
+
+country_results <- do.call(rbind, country_results_list)
+
+region_df <- merged_df[!is.na(merged_df$Region_14), , drop = FALSE]
+region_names <- c(
+  "Central Asia",
+  "Eastern Asia",
+  "Eastern Europe",
+  "Latin America and the Caribbean",
+  "Northern Africa",
+  "Northern America",
+  "Northern Europe",
+  "Oceania",
+  "South-eastern Asia",
+  "Southern Asia",
+  "Southern Europe",
+  "Sub-Saharan Africa",
+  "Western Asia",
+  "Western Europe"
+)
+
+region_results_list <- list()
+counter <- 1
+
+for (rg in region_names) {
+  sub_rg <- region_df[region_df$Region_14 == rg, , drop = FALSE]
+
+  for (v in analysis_vars) {
+    region_results_list[[counter]] <- run_kendall_one_group(
+      data = sub_rg,
+      xvar = v,
+      yvar = "Pattern_code",
+      group_name = rg,
+      group_type = "Region",
+      min_n = 10,
+      min_unique_x = 3,
+      min_unique_y = 2
+    )
+    counter <- counter + 1
+  }
+}
+
+region_results <- do.call(rbind, region_results_list)
+
+var_label_map <- c(
+  "GDP_per_capita_2000" = "GDP per capita in 2000",
+  "GDP_per_capita_2019" = "GDP per capita in 2019",
+  "GDP_per_capita_mean_2000_2019" = "Mean GDP per capita, 2000-2019",
+  "GDP_per_capita_trend_2000_2019_pct" = "Trend in GDP per capita, 2000-2019 (%/year)"
+)
+
+country_results$Variable <- unname(var_label_map[country_results$Variable_name])
+region_results$Variable <- unname(var_label_map[region_results$Variable_name])
+
+country_results <- country_results[, c(
+  "Group_type", "Group_name", "Variable", "Variable_name",
+  "N", "Kendall_tau", "P_value", "Direction", "Significance", "Status"
+), drop = FALSE]
+
+region_results <- region_results[, c(
+  "Group_type", "Group_name", "Variable", "Variable_name",
+  "N", "Kendall_tau", "P_value", "Direction", "Significance", "Status"
+), drop = FALSE]
+
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "Country_Kendall")
+openxlsx::writeData(wb, "Country_Kendall", country_results)
+
+openxlsx::addWorksheet(wb, "Region_Kendall")
+openxlsx::writeData(wb, "Region_Kendall", region_results)
+
+openxlsx::addWorksheet(wb, "README")
+openxlsx::writeData(
+  wb, "README",
+  data.frame(
+    Item = c(
+      "Main data file",
+      "Info data file",
+      "Pattern coding",
+      "Country grouping",
+      "Region grouping",
+      "Fixed region column",
+      "Oceania handling",
+      "Method",
+      "Merge method",
+      "Robust filtering",
+      "Status column"
+    ),
+    Description = c(
+      basename(input_main_rds),
+      basename(input_info_rds),
+      "SD=1, MD=2, MT=3, MI=4, SI=5",
+      "Kendall run separately for each country",
+      "Kendall run separately for 14 target regions",
+      "SUBREGION2",
+      "Australia, New Zealand, other Oceania, and related labels are aggregated into Oceania",
+      "Kendall::Kendall with warning/error capture",
+      "Merged by rounded coordinates (6 decimals)",
+      "Groups with N < 10, too few unique x, or too few unique y are skipped and returned as NA",
+      "Status records whether result is OK, skipped, or warning/error captured"
+    ),
+    stringsAsFactors = FALSE
+  )
+)
+
+openxlsx::saveWorkbook(wb, output_excel, overwrite = TRUE)
+
+write.csv(country_results, output_country_csv, row.names = FALSE, fileEncoding = "UTF-8")
+write.csv(region_results, output_region_csv, row.names = FALSE, fileEncoding = "UTF-8")
+
+saveRDS(
+  list(
+    merged_data = merged_df,
+    country_results = country_results,
+    region_results = region_results
+  ),
+  output_results_rds
+)
+
+cat("\nAnalysis 9 completed successfully.\n")
+cat("Merged data RDS saved to:\n", output_merged_rds, "\n")
+cat("Excel saved to:\n", output_excel, "\n")
+cat("Country CSV saved to:\n", output_country_csv, "\n")
+cat("Region CSV saved to:\n", output_region_csv, "\n")
+cat("Results RDS saved to:\n", output_results_rds, "\n")
+```
