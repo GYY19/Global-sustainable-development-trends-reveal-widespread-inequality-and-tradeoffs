@@ -1,4 +1,4 @@
-# Mapping global high-resolution sustainable development trends over two decades
+# Global sustainable development trends reveal widespread inequality and tradeoffs
 
 This is for the article "Mapping global high-resolution sustainable development trends over two decades". We use four headline indicators to measure sustainable development trends over the past two decades. The indicators are:
     
