@@ -1,6 +1,6 @@
 # Global sustainable development trends reveal widespread inequality and tradeoffs
 
-This is for the article "Mapping global high-resolution sustainable development trends over two decades". We use four headline indicators to measure sustainable development trends over the past two decades. The indicators are:
+This is for the article "Global-sustainable-development-trends-reveal-widespread-inequality-and-tradeoffs". We use four headline indicators to measure sustainable development trends over the past two decades. The indicators are:
     
     * PM2.5 – as a air pollution control indicator
     * CO2 – as a climate change mitigation indicator
