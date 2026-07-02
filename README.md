@@ -7,4 +7,11 @@ This is for the article "Global-sustainable-development-trends-reveal-widespread
     * Nightlight – as a socioeconomic activity and infrastructure development indicator
     * NDVI – as an ecosystem vitality indicator
 
-The involved annual average indicator data have been located in the [Figshare](https://doi.org/10.6084/m9.figshare.30234031). For the relevant code, please see the 'code.Rmd' document.
+The data used in this study are available from Figshare at: https://doi.org/10.6084/m9.figshare.30234031
+
+For the relevant code, please see the 'code.Rmd' document.
+
+## License
+
+The code in this repository is released under the MIT License. See the LICENSE file for details.
+
